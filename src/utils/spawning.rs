@@ -274,13 +274,16 @@ mod systemd {
 
             // Double-fork to avoid having to waitpid the child.
             process.pre_exec(move || {
-                // Close FDs that we don't need. Especially important for the write ones to unblock
-                // the readers.
+                // Close FDs that we don't need. Especially important to unblock the readers,
+                // and to allow Command::spawn() to return in the parent process.
                 if let Some(fd) = pipe_pid_read_fd.take() {
                     close(fd);
                 }
                 if let Some(fd) = pipe_wait_write_fd.take() {
-                    close(fd);
+                    #[cfg(not(target_os = "openbsd"))]
+                    close_range(fd as u32, !0, 0);
+                    #[cfg(target_os = "openbsd")]
+                    closefrom(fd);
                 }
 
                 // Convert the FDs to OwnedFd, which will close them in all of our fork paths.
@@ -289,7 +292,12 @@ mod systemd {
 
                 match libc::fork() {
                     -1 => return Err(io::Error::last_os_error()),
-                    0 => (),
+                    0 => {
+                        // Wait until the parent signals us to exec.
+                        if let Some(pipe) = pipe_wait_read {
+                            let _ = read_all(pipe, &mut [0]);
+                        }
+                    },
                     grandchild_pid => {
                         // Send back the PID.
                         if let Some(pipe) = pipe_pid_write {
@@ -298,23 +306,6 @@ mod systemd {
 
                         // Wait until the parent signals us to exit.
                         if let Some(pipe) = pipe_wait_read {
-                            // We're going to exit afterwards. Close all other FDs to allow
-                            // Command::spawn() to return in the parent process.
-                            #[cfg(not(target_os = "openbsd"))]
-                            {
-                                let raw = pipe.as_raw_fd() as u32;
-                                let _ = close_range(0, raw - 1, 0);
-                                let _ = close_range(raw + 1, !0, 0);
-                            }
-                            #[cfg(target_os = "openbsd")]
-                            {
-                                let raw = pipe.as_raw_fd();
-                                for fd in 0..raw {
-                                    close(fd);
-                                }
-                                closefrom(raw + 1);
-                            }
-
                             let _ = read_all(pipe, &mut [0]);
                         }
 
